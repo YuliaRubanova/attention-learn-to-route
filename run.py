@@ -6,13 +6,13 @@ import pprint as pp
 
 import torch
 import torch.optim as optim
-from tensorboard_logger import Logger as TbLogger
 
 from nets.critic_network import CriticNetwork
 from options import get_options
 from train import train_epoch, validate, get_inner_model
 from reinforce_baselines import NoBaseline, ExponentialBaseline, CriticBaseline, RolloutBaseline, WarmupBaseline
 from nets.attention_model import AttentionModel
+from nets.edge_predictor import EdgeAttentionModel
 from nets.pointer_network import PointerNetwork, CriticNetworkLSTM
 from utils import torch_load_cpu, load_problem
 
@@ -28,6 +28,7 @@ def run(opts):
     # Optionally configure tensorboard
     tb_logger = None
     if not opts.no_tensorboard:
+        from tensorboard_logger import Logger as TbLogger
         tb_logger = TbLogger(os.path.join(opts.log_dir, "{}_{}".format(opts.problem, opts.graph_size), opts.run_name))
 
     os.makedirs(opts.save_dir)
@@ -49,19 +50,24 @@ def run(opts):
         print('  [*] Loading data from {}'.format(load_path))
         load_data = torch_load_cpu(load_path)
 
+    if opts.problem == "edgetsp":
+        opts.model = "edge_attention"
+        print("Setting the model to edge_attention..")
+
     # Initialize model
     model_class = {
         'attention': AttentionModel,
+        "edge_attention": EdgeAttentionModel,
         'pointer': PointerNetwork
     }.get(opts.model, None)
     assert model_class is not None, "Unknown model: {}".format(model_class)
     model = model_class(
-        opts.embedding_dim,
-        opts.hidden_dim,
-        problem,
+        embedding_dim=opts.embedding_dim,
+        hidden_dim=opts.hidden_dim,
+        problem=problem,
         n_encode_layers=opts.n_encode_layers,
-        mask_inner=False,
-        mask_logits=False,
+        mask_inner=False, # !!! was: True
+        mask_logits=False, # !!! was: true
         normalization=opts.normalization,
         tanh_clipping=opts.tanh_clipping,
         checkpoint_encoder=opts.checkpoint_encoder,
