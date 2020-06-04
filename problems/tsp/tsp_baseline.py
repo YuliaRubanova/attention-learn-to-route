@@ -236,6 +236,15 @@ def run_insertion(loc, method):
                 a = D.max(1).argmax()  # Node with farthest distance to any other node
             else:
                 a = feas_ind[D[np.ix_(feas, ~feas)].min(1).argmax()]  # node which has closest node in tour farthest
+        elif method == 'closestneighbor':
+            if i == 0:
+                 a = D.max(1).argmax(i)
+            else:
+                 # 'a' is the last added nodei
+                 route_indices =  np.flatnonzero(mask == 1)
+                 ind_last = np.flatnonzero(route_indices == a)
+                 a = feas_ind[D[np.ix_(feas, ~feas)][:,ind_last].argmin()] # node nearest to the last one in the tour 
+        
         mask[a] = True
 
         if len(tour) == 0:
