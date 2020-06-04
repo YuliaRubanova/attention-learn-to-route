@@ -92,10 +92,10 @@ class AttentionModel(nn.Module):
             if self.is_vrp and self.allow_partial:  # Need to include the demand if split delivery allowed
                 self.project_node_step = nn.Linear(1, 3 * embedding_dim, bias=False)
         else:  # TSP
-            assert problem.NAME == "tsp", "Unsupported problem: {}".format(problem.NAME)
+            assert problem.NAME == "tsp" or problem.NAME == "edgetsp", "Unsupported problem: {}".format(problem.NAME)
             step_context_dim = 2 * embedding_dim  # Embedding of first and last node
             node_dim = 2  # x, y
-            
+
             # Learned input symbols for first action
             self.W_placeholder = nn.Parameter(torch.Tensor(2 * embedding_dim))
             self.W_placeholder.data.uniform_(-1, 1)  # Placeholder should be in range of activations
@@ -115,6 +115,7 @@ class AttentionModel(nn.Module):
         self.project_step_context = nn.Linear(step_context_dim, embedding_dim, bias=False)
         assert embedding_dim % n_heads == 0
         # Note n_heads * val_dim == embedding_dim so input to project_out is embedding_dim
+        self.project_glimpse = nn.Linear(2 * embedding_dim, embedding_dim, bias=False)
         self.project_out = nn.Linear(embedding_dim, embedding_dim, bias=False)
 
     def set_decode_type(self, decode_type, temp=None):
@@ -228,7 +229,7 @@ class AttentionModel(nn.Module):
         sequences = []
 
         state = self.problem.make_state(input)
-
+        
         # Compute keys, values for the glimpse and keys for the logits once as they can be reused in every step
         fixed = self._precompute(embeddings)
 
@@ -295,17 +296,19 @@ class AttentionModel(nn.Module):
 
         if self.decode_type == "greedy":
             _, selected = probs.max(1)
-            assert not mask.gather(1, selected.unsqueeze(
-                -1)).data.any(), "Decode greedy: infeasible action has maximum probability"
+            # !!! ignoring the fact that we are visiting the same node twice
+            # assert not mask.gather(1, selected.unsqueeze(
+            #    -1)).data.any(), "Decode greedy: infeasible action has maximum probability"
 
         elif self.decode_type == "sampling":
             selected = probs.multinomial(1).squeeze(1)
 
             # Check if sampling went OK, can go wrong due to bug on GPU
             # See https://discuss.pytorch.org/t/bad-behavior-of-multinomial-function/10232
-            while mask.gather(1, selected.unsqueeze(-1)).data.any():
-                print('Sampled bad values, resampling!')
-                selected = probs.multinomial(1).squeeze(1)
+            # !!! ignoring the fact that we are visiting the same node twice
+            #while mask.gather(1, selected.unsqueeze(-1)).data.any():
+            #    print('Sampled bad values, resampling!')
+            #    selected = probs.multinomial(1).squeeze(1)
 
         else:
             assert False, "Unknown decode type"
@@ -449,8 +452,7 @@ class AttentionModel(nn.Module):
                 ), 2)
             ), 1)
 
-    def _one_to_many_logits(self, query, glimpse_K, glimpse_V, logit_K, mask):
-
+    def _compute_glimpse(self, query, glimpse_K, glimpse_V, mask):
         batch_size, num_steps, embed_dim = query.size()
         key_size = val_size = embed_dim // self.n_heads
 
@@ -459,8 +461,7 @@ class AttentionModel(nn.Module):
 
         # Batch matrix multiplication to compute compatibilities (n_heads, batch_size, num_steps, graph_size)
         compatibility = torch.matmul(glimpse_Q, glimpse_K.transpose(-2, -1)) / math.sqrt(glimpse_Q.size(-1))
-        if self.mask_inner:
-            assert self.mask_logits, "Cannot mask inner without masking logits"
+        if mask is not None:
             compatibility[mask[None, :, :, None, :].expand_as(compatibility)] = -math.inf
 
         # Batch matrix multiplication to compute heads (n_heads, batch_size, num_steps, val_size)
@@ -469,9 +470,18 @@ class AttentionModel(nn.Module):
         # Project to get glimpse/updated context node embedding (batch_size, num_steps, embedding_dim)
         glimpse = self.project_out(
             heads.permute(1, 2, 3, 0, 4).contiguous().view(-1, num_steps, 1, self.n_heads * val_size))
+        return glimpse
 
+ 
+    def _one_to_many_logits(self, query, glimpse_K, glimpse_V, logit_K, mask):
+        # Compute glimpse only on the graph that is not included into the path yet
+        #glimpse_unused_nodes = self._compute_glimpse(query, glimpse_K, glimpse_V, logit_K, mask) 
+        # Compute glimpse on the whole graph
+        glimpse = self._compute_glimpse(query, glimpse_K, glimpse_V, None)
         # Now projecting the glimpse is not needed since this can be absorbed into project_out
+        #glimpse = torch.cat((glimpse_unused_nodes, glimpse_graph), -1) 
         # final_Q = self.project_glimpse(glimpse)
+
         final_Q = glimpse
         # Batch matrix multiplication to compute logits (batch_size, num_steps, graph_size)
         # logits = 'compatibility'

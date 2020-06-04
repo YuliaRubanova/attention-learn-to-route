@@ -5,7 +5,6 @@ import pickle
 from problems.tsp.state_tsp import StateTSP
 from utils.beam_search import beam_search
 
-
 class TSP(object):
 
     NAME = 'tsp'
@@ -13,16 +12,27 @@ class TSP(object):
     @staticmethod
     def get_costs(dataset, pi):
         # Check that tours are valid, i.e. contain 0 to n -1
-        assert (
-            torch.arange(pi.size(1), out=pi.data.new()).view(1, -1).expand_as(pi) ==
-            pi.data.sort(1)[0]
-        ).all(), "Invalid tour"
+        
+        unique_nodes = torch.arange(pi.size(1), out=pi.data.new()).view(1, -1).expand_as(pi) == pi.data.sort(1)[0]
+        n_unique = unique_nodes.sum(1)
+        is_valid_tour = unique_nodes.all()
+        
+        #assert is_valid_tour, "Invalid tour"
 
         # Gather dataset in order of tour
         d = dataset.gather(1, pi.unsqueeze(-1).expand_as(dataset))
 
         # Length is distance (L2-norm of difference) from each next location from its prev and of last from first
-        return (d[:, 1:] - d[:, :-1]).norm(p=2, dim=2).sum(1) + (d[:, 0] - d[:, -1]).norm(p=2, dim=1), None
+        costs = (d[:, 1:] - d[:, :-1]).norm(p=2, dim=2).sum(1) + (d[:, 0] - d[:, -1]).norm(p=2, dim=1)
+        
+        n_nodes = pi.size(1)
+        n_missing_nodes = n_nodes - n_unique
+        
+        costs += n_missing_nodes * 10 # penalize each path by the number of missing nodes
+        # if not is_valid_tour:
+        #    costs += 100 # !!! ad-hoc penalty if tour is invalid
+
+        return costs, None
 
     @staticmethod
     def make_dataset(*args, **kwargs):
