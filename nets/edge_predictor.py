@@ -17,7 +17,7 @@ class EdgeAttentionModel(AttentionModel):
     def __init__(self, **kwargs):
         super(EdgeAttentionModel, self).__init__(**kwargs)
         self.project_from_heads = nn.Linear(self.n_heads, 1, bias=False)
-        self.project_attention = nn.Linear(self.embedding_dim * 4, 1, bias=False)
+        self.project_attention = nn.Linear(self.embedding_dim * 2 +1, 1, bias=False)
         self.project_compatibility = nn.Linear(self.embedding_dim // self.n_heads * 3 + 1, 1, bias=False)
 
     def forward(self, input, return_pi=False):
@@ -27,7 +27,6 @@ class EdgeAttentionModel(AttentionModel):
         using DataParallel as the results may be of different lengths on different GPUs
         :return:
         """
-
         if self.checkpoint_encoder and self.training:  # Only checkpoint if we need gradients
             embeddings, _ = checkpoint(self.embedder, self._init_embed(input))
         else:
@@ -36,6 +35,7 @@ class EdgeAttentionModel(AttentionModel):
         _log_p, actions, adjacency = self._inner(input, embeddings)
 
         cost, mask = self.problem.get_costs(input, adjacency)
+
         # Log likelyhood is calculated within the model since returning it per action does not work well with
         # DataParallel since sequences can be of different lengths
         ll = self._calc_log_likelihood(_log_p, actions, mask)
@@ -64,13 +64,14 @@ class EdgeAttentionModel(AttentionModel):
             log_p, mask = self._get_log_p(fixed, state)
 
             # Select the next edge
-            selected = self._select_node(log_p.exp()[:, 0, :], mask[:, 0, :])  # Squeeze out steps dimension
+            # todo: remake selection function
+            selected = self._select_node(log_p.exp().squeeze(1), mask.squeeze(1))  # Squeeze out steps dimension
 
             n_nodes = state.n_nodes
             selected_edge_mask = torch.zeros(batch_size, 1, n_nodes**2)
             selected_edge_mask = selected_edge_mask.scatter(-1, selected[:, None, None], 1)
             selected_edge_mask = selected_edge_mask.view(batch_size, n_nodes, n_nodes)
-       
+
             state = state.update(selected)
 
             # Collect output of step
@@ -98,6 +99,7 @@ class EdgeAttentionModel(AttentionModel):
 
         assert not torch.isnan(log_p).any()
 
+        # todo: normalization
         if normalize:
             log_p = torch.log_softmax(log_p / self.temp, dim=-1)
 
@@ -108,18 +110,31 @@ class EdgeAttentionModel(AttentionModel):
     def _one_to_edge_logits(self, glimpse_Q, glimpse_K, glimpse_V, mask, graph_embedding):
         # TODO: use different projections for two types of attention 
         # todo: do we want to use a mask in _compute_parwise_attention x?
-        node_attention = self._compute_parwise_attention(glimpse_Q, glimpse_K) 
+        #node_attention = self._compute_parwise_attention(glimpse_Q, glimpse_K) 
 
         node_connectivity_glimpse = self._compute_graph_glimpse(
             glimpse_V, glimpse_Q, glimpse_K, mask, graph_embedding)
         node_connectivity_glimpse = node_connectivity_glimpse.unsqueeze(0)
 
+        # todo: correct normalization
+        # for_choosing_src = self.project  (node_connectivity_glimpse)
+
+        # # todo: correct normalization
+        # for_choosing_dst = self.project (node_connectivity_glimpse)
+
+
+        # connectivity_attention = self._compute_parwise_attention(
+        #     for_choosing_dst, for_choosing_dst) 
 
         connectivity_attention = self._compute_parwise_attention(
-            node_connectivity_glimpse, node_connectivity_glimpse) 
+            node_connectivity_glimpse, node_connectivity_glimpse, mask) 
         
+        # edge_attention = self._compute_final_attention_mask(
+        #     [node_attention, connectivity_attention], mask)
+
+        # todo: correct normalization
         edge_attention = self._compute_final_attention_mask(
-            [node_attention, connectivity_attention], mask)
+            connectivity_attention, mask)
 
         assert not torch.isnan(edge_attention).any()
 
@@ -131,6 +146,7 @@ class EdgeAttentionModel(AttentionModel):
 
         assert not torch.isnan(edge_attention).any()
 
+        # return for_choosing_src, edge_attention
         return edge_attention
 
 
@@ -148,7 +164,7 @@ class EdgeAttentionModel(AttentionModel):
 
 
 
-    def _compute_parwise_attention(self, glimpse_Q, glimpse_K):
+    def _compute_parwise_attention(self, glimpse_Q, glimpse_K, mask):
         n_heads, batch_size, num_steps, n_nodes, embed_dim = glimpse_Q.size()
         key_size = val_size = embed_dim // self.n_heads
 
@@ -156,6 +172,7 @@ class EdgeAttentionModel(AttentionModel):
         # attention = torch.matmul(glimpse_Q, glimpse_K.transpose(-2, -1))
         # attention = self.project_from_heads(attention.permute(1, 2, 3, 4, 0)).squeeze(-1)
 
+        # todo: do some projection here?
         expanded_shape = (n_heads, batch_size, num_steps, n_nodes, n_nodes, embed_dim)
 
         attention = torch.cat((
@@ -169,6 +186,7 @@ class EdgeAttentionModel(AttentionModel):
         attention = attention.reshape(batch_size, num_steps, 
             n_nodes, n_nodes, -1)
 
+        attention = torch.cat((attention, mask[:,:,:,:,None].float()), -1)
         return attention
 
  
@@ -183,7 +201,6 @@ class EdgeAttentionModel(AttentionModel):
 
         # Batch matrix multiplication to compute compatibilities (n_heads, batch_size, num_steps, graph_size)
         #compatibility = torch.matmul(glimpse_Q, glimpse_K.transpose(-2, -1)) / math.sqrt(glimpse_Q.size(-1))
-
 
         expanded_shape = (self.n_heads, batch_size, num_steps, n_nodes, n_nodes, key_size)
 
