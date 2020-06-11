@@ -75,14 +75,28 @@ class StateEdgeTSP(NamedTuple):
         # assert self.all_finished()
         # return self.lengths + (self.loc[self.ids, self.first_a, :] - self.cur_coord).norm(p=2, dim=-1)
 
-    def update(self, selected_edge_ids):
+    def update(self, src_nodes, dst_nodes):
         # each element in "selected" is a chosen edge represented as binary [n_nodes x n_nodes] matrix
         visited_edges = self.visited_edges
 
         batch_size, _, n_nodes, n_nodes = visited_edges.shape
+
+        n_current_edges = visited_edges.sum(-1).sum(-1)
+
         visited_edges = visited_edges.view(batch_size, 1, n_nodes**2)
-        visited_edges = visited_edges.scatter(-1, selected_edge_ids[:, None, None], 1)
+        index = src_nodes * n_nodes + dst_nodes
+        visited_edges = visited_edges.scatter(-1, index[:, None, None], 1)
         visited_edges = visited_edges.view(batch_size, 1, n_nodes, n_nodes)
+
+        assert visited_edges[0, 0, src_nodes[0], dst_nodes[0]] == 1
+
+        # for mask_, x, y in zip(visited_edges, src_nodes, dst_nodes):
+        #     mask_[:, x, y] = 1
+
+        n_new_edges = visited_edges.sum(-1).sum(-1)
+        # Check that we have added exactly one edge 
+        assert (n_new_edges - n_current_edges == 1).all()
+
 
         # To get a mask over visited nodes, just note which nodes have outgoing edges
         visited_ = visited_edges.sum(-1) > 0

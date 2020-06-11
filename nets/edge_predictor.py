@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 import math
+import numpy as np
 from typing import NamedTuple
 from utils.tensor_functions import compute_in_batches
 
@@ -17,6 +18,10 @@ class EdgeAttentionModel(AttentionModel):
     def __init__(self, **kwargs):
         super(EdgeAttentionModel, self).__init__(**kwargs)
         self.project_from_heads = nn.Linear(self.n_heads, 1, bias=False)
+
+        self.project_for_src_node = nn.Linear(self.embedding_dim, 1)
+        self.project_for_dst_node = nn.Linear(self.embedding_dim, self.embedding_dim)
+
         self.project_attention = nn.Linear(self.embedding_dim * 2 +1, 1, bias=False)
         self.project_compatibility = nn.Linear(self.embedding_dim // self.n_heads * 3 + 1, 1, bias=False)
 
@@ -32,24 +37,32 @@ class EdgeAttentionModel(AttentionModel):
         else:
             embeddings, _ = self.embedder(self._init_embed(input))
 
-        _log_p, actions, adjacency = self._inner(input, embeddings)
+        node_log_p, edge_log_p, node_actions, edge_actions, adjacency = self._inner(input, embeddings)
 
         cost, mask = self.problem.get_costs(input, adjacency)
 
         # Log likelyhood is calculated within the model since returning it per action does not work well with
         # DataParallel since sequences can be of different lengths
-        ll = self._calc_log_likelihood(_log_p, actions, mask)
+
+        node_ll = self._calc_log_likelihood(node_log_p, node_actions, None)
+        edge_ll = self._calc_log_likelihood(edge_log_p, edge_actions, None)
+
+        ll = node_ll + edge_ll
+
         if return_pi:
-            return cost, ll, pi
+            return cost, ll, adjacency
 
         return cost, ll
 
 
     def _inner(self, input, embeddings):
+        node_probs = []
+        edge_probs = []
 
-        probs = []
-        actions = []
-        action_masks = []
+        node_actions = []
+        edge_actions = []
+
+        edge_masks = []
 
         state = self.problem.make_state(input)
 
@@ -61,29 +74,53 @@ class EdgeAttentionModel(AttentionModel):
         # Perform decoding steps
         i = 0
         while not (self.shrink_size is None and state.all_finished()):
-            log_p, mask = self._get_log_p(fixed, state)
+            log_p_nodes, log_p_edges, mask = self._get_log_p(fixed, state)
 
-            # Select the next edge
-            # todo: remake selection function
-            selected = self._select_node(log_p.exp().squeeze(1), mask.squeeze(1))  # Squeeze out steps dimension
+            # Select the source node
+            selected_node = self._select_node(log_p_nodes.exp().squeeze(1), None)  # Squeeze out steps dimension
+
+            batch_size, n_steps, n_nodes, n_nodes = log_p_edges.shape
+
+            selected_node_to_gather = selected_node[:, None, None, None].expand(batch_size, n_steps, 1, n_nodes)
+
+            selected_dst_logits = log_p_edges.gather(2, selected_node_to_gather).squeeze(1)
+
+            # Check that each row is normalized to sum to 1
+            assert (selected_dst_logits.exp().sum(-1) - 1 < 1e-6).all()
+
+            selected_dst_nodes = self._select_node(selected_dst_logits.exp().squeeze(1), None)
 
             n_nodes = state.n_nodes
             selected_edge_mask = torch.zeros(batch_size, 1, n_nodes**2)
-            selected_edge_mask = selected_edge_mask.scatter(-1, selected[:, None, None], 1)
+            index = selected_node * n_nodes + selected_dst_nodes
+            selected_edge_mask = selected_edge_mask.scatter(-1, index[:, None, None], 1)
             selected_edge_mask = selected_edge_mask.view(batch_size, n_nodes, n_nodes)
 
-            state = state.update(selected)
+            # for mask_, x, y in zip(selected_edge_mask, selected_node, selected_dst_nodes):
+            #     mask_[x, y] = 1
+
+            assert selected_edge_mask[0, selected_node[0], selected_dst_nodes[0]] == 1
+
+            assert (selected_edge_mask.sum(-1).sum(-1) - 1 < 1e-6).all()
+
+            state = state.update(selected_node, selected_dst_nodes)
 
             # Collect output of step
-            probs.append(log_p[:, 0, :])
-            actions.append(selected)
-            action_masks.append(selected_edge_mask)
+            node_probs.append(log_p_nodes[:, 0, :])
+            edge_probs.append(selected_dst_logits[:, 0, :])
+
+            node_actions.append(selected_node)
+            edge_actions.append(selected_dst_nodes)
+
+            edge_masks.append(selected_edge_mask)
 
             i += 1
 
         # Return 1) Probability distributions 2) Chosen actions (edges) 
         # 3) A combined adjacency matrix
-        return torch.stack(probs, 1), torch.stack(actions, 1), torch.sum(torch.stack(action_masks, 1), 1)
+        return torch.stack(node_probs, 1), torch.stack(edge_probs, 1), \
+            torch.stack(node_actions, 1), torch.stack(edge_actions, 1), \
+            torch.sum(torch.stack(edge_masks, 1), 1)
 
 
     def _get_log_p(self, fixed, state, normalize=True):
@@ -94,47 +131,37 @@ class EdgeAttentionModel(AttentionModel):
         mask = state.get_mask()
 
         # Compute logits (unnormalized log_p)
-        log_p = self._one_to_edge_logits(glimpse_Q, glimpse_K, glimpse_V,
+        log_p_nodes, log_p_edges = self._one_to_edge_logits(glimpse_Q, glimpse_K, glimpse_V,
             mask, fixed.context_node_projected)
 
-        assert not torch.isnan(log_p).any()
+        assert not torch.isnan(log_p_nodes).any()
+        assert not torch.isnan(log_p_edges).any()
 
-        # todo: normalization
         if normalize:
-            log_p = torch.log_softmax(log_p / self.temp, dim=-1)
+            log_p_nodes = torch.log_softmax(log_p_nodes / self.temp, dim=-1)
+            log_p_edges = torch.log_softmax(log_p_edges / self.temp, dim=-1)
 
-        assert not torch.isnan(log_p).any()
-        return log_p, mask
+        assert not torch.isnan(log_p_nodes).any()
+        assert not torch.isnan(log_p_edges).any()
+
+        return log_p_nodes, log_p_edges, mask
 
 
     def _one_to_edge_logits(self, glimpse_Q, glimpse_K, glimpse_V, mask, graph_embedding):
-        # TODO: use different projections for two types of attention 
-        # todo: do we want to use a mask in _compute_parwise_attention x?
-        #node_attention = self._compute_parwise_attention(glimpse_Q, glimpse_K) 
-
         node_connectivity_glimpse = self._compute_graph_glimpse(
             glimpse_V, glimpse_Q, glimpse_K, mask, graph_embedding)
         node_connectivity_glimpse = node_connectivity_glimpse.unsqueeze(0)
 
-        # todo: correct normalization
-        # for_choosing_src = self.project  (node_connectivity_glimpse)
-
-        # # todo: correct normalization
-        # for_choosing_dst = self.project (node_connectivity_glimpse)
-
-
-        # connectivity_attention = self._compute_parwise_attention(
-        #     for_choosing_dst, for_choosing_dst) 
-
-        connectivity_attention = self._compute_parwise_attention(
-            node_connectivity_glimpse, node_connectivity_glimpse, mask) 
+        node_selection_logits = self.project_for_src_node(node_connectivity_glimpse).squeeze(-1)
+        node_selection_logits = node_selection_logits.squeeze(0) # squeeze heads dimension
         
-        # edge_attention = self._compute_final_attention_mask(
-        #     [node_attention, connectivity_attention], mask)
+        dst_nodes = self.project_for_dst_node(node_connectivity_glimpse)
 
-        # todo: correct normalization
+        edge_attention_input = self._compute_parwise_attention_input(
+            dst_nodes, dst_nodes, mask) 
+
         edge_attention = self._compute_final_attention_mask(
-            connectivity_attention, mask)
+            edge_attention_input, mask)
 
         assert not torch.isnan(edge_attention).any()
 
@@ -142,12 +169,10 @@ class EdgeAttentionModel(AttentionModel):
         batch_size, _, n_nodes, n_nodes = edge_attention.shape
         
         # squeeze the probs over edges [n_nodes x n_nodes] in one dimention
-        edge_attention = edge_attention.view(batch_size, 1, n_nodes**2)
+        #edge_attention = edge_attention.view(batch_size, 1, n_nodes**2)
 
         assert not torch.isnan(edge_attention).any()
-
-        # return for_choosing_src, edge_attention
-        return edge_attention
+        return node_selection_logits, edge_attention
 
 
     def _compute_final_attention_mask(self, attention, mask):
@@ -164,7 +189,7 @@ class EdgeAttentionModel(AttentionModel):
 
 
 
-    def _compute_parwise_attention(self, glimpse_Q, glimpse_K, mask):
+    def _compute_parwise_attention_input(self, glimpse_Q, glimpse_K, mask):
         n_heads, batch_size, num_steps, n_nodes, embed_dim = glimpse_Q.size()
         key_size = val_size = embed_dim // self.n_heads
 
@@ -172,7 +197,6 @@ class EdgeAttentionModel(AttentionModel):
         # attention = torch.matmul(glimpse_Q, glimpse_K.transpose(-2, -1))
         # attention = self.project_from_heads(attention.permute(1, 2, 3, 4, 0)).squeeze(-1)
 
-        # todo: do some projection here?
         expanded_shape = (n_heads, batch_size, num_steps, n_nodes, n_nodes, embed_dim)
 
         attention = torch.cat((
